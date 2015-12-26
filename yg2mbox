@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+# vim: set fileencoding=utf8 :
+
+import http.client, sys, os, mailbox, time, json, re, html.entities, email, email.policy
+from base64 import b64decode
+from pprint import pprint
+
+class YahooException (Exception):
+    pass
+
+class Fetch (object):
+    """
+    throttled url fetcher
+    """
+
+    # limits per hour
+    # 0.6, 0.7, 0.8, 0.9 seem to be fine
+    # 0.5 is too much
+    WAIT = 0.6
+    TEMP_ERROR_CODE = [1001, 1007]
+
+    def __init__ (self, host):
+        self.conn = http.client.HTTPSConnection (host)
+        self.lastfetch = 0
+
+    def fetch (self, path):
+        tries = 0
+        wait = self.WAIT
+        while tries < 3:
+            while True:
+                now = time.time ()
+                if self.lastfetch < now-wait:
+                    break
+                time.sleep (wait)
+
+            self.lastfetch = now
+
+            print ('fetching {}'.format (path))
+            self.conn.request ('GET', path)
+            resp = self.conn.getresponse ()
+            try:
+                o = json.loads (resp.read ().decode ('utf-8'))
+            except ValueError:
+                if resp.find ('error 999') != -1:
+                    print ('we got banned')
+                else:
+                    # retry
+                    continue
+
+            if 'ygError' in o:
+                err = o['ygError']
+                pprint (o)
+                if err['errorCode'] in self.TEMP_ERROR_CODE:
+                    tries += 1
+                    wait *= 2
+                    continue
+                raise YahooException (o['ygError']['errorCode'])
+
+            return o['ygData']
+        raise YahooException ('cannot fetch shit')
+
+def _entitysub (match):
+    if match.group (1) == '#':
+        return chr (int (match.group (2)))
+    elif match.group (1).lower () == '#x':
+        return chr (int (match.group (2), 16))
+    else:
+        return chr (html.entities.name2codepoint.get (match.group(2), 0xfffd))
+
+def storemessage (mb, data):
+    entityre = re.compile (r'&(#|#x|)([a-z0-9]+);', re.I)
+    fixfromre = re.compile ('.*? <.*?@\.\.\.$', re.I)
+
+    # actually the email is not raw, but html quoted
+    rawemail = entityre.sub (_entitysub, data['rawEmail'])
+
+    # XXX: encoding will probably destroy any non-ascii chars
+    m = email.message_from_bytes (rawemail.encode ('utf-8'))
+    # there’s uncensored headers here, base64-encoded
+    headerMap = {
+            'messageIdInHeader': 'Message-Id',
+            'inReplyToHeader': 'In-Reply-To',
+            'referencesHeader': 'References',
+            }
+    for k, v in data['headers'].items ():
+        if k in headerMap:
+            if headerMap[k] not in m:
+                m.add_header (headerMap[k], b64decode (v).decode ('utf8'))
+            else:
+                m.replace_header (headerMap[k], b64decode (v).decode ('utf8'))
+        else:
+            print ('no header name known for {}'.format (k))
+
+    # add interesting headers
+    m['X-YahooArchiver-MsgId'] = '{}'.format (data['msgId'])
+
+    # Mark message as read
+    m['Status'] = 'R'
+
+    # fix from email address, someone made a mistake and replaced
+    # everything after the @ with just three dots, breaking ("john doe" <foo@)
+    if 'From' in m:
+        if fixfromre.match (m['From']):
+            m.replace_header ('From', m['From'] + '>')
+        elif m['From'][-1] == ')':
+            m.replace_header ('From', m['From'][:-1])
+
+    mb.add (m)
+
+if __name__ == '__main__':
+    listname = sys.argv[1]
+    mboxpath = sys.argv[2]
+
+    # delete if it exists, we’re gonna append _all_ messages anyway
+    if os.path.isfile (mboxpath):
+        os.remove (mboxpath)
+    mb = mailbox.mbox (mboxpath)
+
+    f = Fetch ('groups.yahoo.com')
+    start = 0
+
+    while True:
+        path = '/api/v1/groups/{}/messages?count=100&start={}&sortOrder=asc&direction=1'.format (listname, start)
+        try:
+            data = f.fetch (path)
+        except YahooException:
+            break
+
+        added = 0
+        maxid = start
+        for m in data['messages']:
+            msgid = int (m['messageId'])
+            if msgid < start:
+                # have that one already
+                continue
+            maxid = max (maxid, msgid)
+            added += 1
+
+            # fetch raw message
+            try:
+                path = '/api/v1/groups/{}/messages/{}/raw'.format (listname, msgid)
+                rawmsg = f.fetch (path)
+                assert rawmsg['msgId'] == msgid
+                storemessage (mb, rawmsg)
+            except YahooException:
+                print ('cannot fetch raw message body')
+        start = maxid+1
+        if added == 0:
+            break
+
